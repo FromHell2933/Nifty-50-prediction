@@ -1,0 +1,204 @@
+import yfinance as yf
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import precision_score
+from sklearn.model_selection import GridSearchCV
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+
+
+nifty = yf.Ticker("^NSEI")
+nifty = nifty.history(period="max")
+nifty.index = pd.to_datetime(nifty.index)
+nifty.index = nifty.index.astype(str).str.replace('00:00:00+05:30', '')
+nifty.head()
+
+
+nifty.plot.line(y="Close", use_index=True)
+plt.title("Nifty 50 Closing Price Over Time")
+plt.show()
+
+nifty = nifty.drop(columns=["Dividends", "Stock Splits"])
+
+nifty["Tomorrow"] = nifty["Close"].shift(-1)
+nifty["Target"] = (nifty["Tomorrow"] > nifty["Close"]).astype(int)
+nifty = nifty.dropna()
+nifty
+
+
+
+
+vix=yf.Ticker("^VIX")
+vix=vix.history(period="max")
+vix.index=pd.to_datetime(vix.index)
+vix.rename(columns={'Open': 'Open_V', 'High': 'High_V','Low':'Low_V','Close':'Close_V'}, inplace=True)
+vix= vix.drop(columns=["Dividends", "Stock Splits","Volume"])
+vix=vix.loc["2007-09-17":]
+vix.index = vix.index.astype(str).str.replace('00:00:00-06:00', '')
+vix.index = vix.index.astype(str).str.replace('00:00:00-05:00', '')
+
+vix
+
+sp = yf.Ticker("^GSPC")
+sp = sp.history(period="max")
+sp.index = pd.to_datetime(sp.index)
+sp= sp.drop(columns=["Dividends", "Stock Splits","Volume"])
+sp=sp.loc["2007-09-17":]
+sp.index = sp.index.astype(str).str.replace('00:00:00-04:00', '')
+sp.index = sp.index.astype(str).str.replace('00:00:00-05:00', '')
+sp.rename(columns={'Open': 'Open_S', 'High': 'High_S','Low':'Low_S','Close':'Close_S'}, inplace=True)
+sp
+
+nifty.index = pd.to_datetime(nifty.index)
+vix.index=pd.to_datetime(vix.index)
+nifty = pd.merge(nifty, vix,on='Date')
+nifty.to_csv('nifty_vix.csv')
+nifty
+
+horizons = [2, 5, 10, 20, 60, 250]
+new_predictors = ["Close", "Volume", "Open", "High", "Low","Open_V","High_V","Low_V","Close_V"]
+
+for horizon in horizons:
+    rolling_avg = nifty["Close"].rolling(window=horizon).mean()
+    nifty[f"Close_Ratio_{horizon}"] = nifty["Close"] / rolling_avg
+    nifty[f"Momentum_{horizon}"] = nifty["Close"] - nifty["Close"].shift(horizon)
+    nifty[f"Trend_{horizon}"] = nifty["Target"].shift(1).rolling(window=horizon).sum()
+    nifty[f"Momentum_V{horizon}"] = nifty["Close_V"] - nifty["Close_V"].shift(horizon)
+    nifty[f"Close_Ratio_V{horizon}"] = nifty["Close_V"] / rolling_avg
+    new_predictors += [f"Close_Ratio_{horizon}", f"Momentum_{horizon}", f"Trend_{horizon}",f"Momentum_V{horizon}",f"Close_Ratio_V{horizon}"]
+
+nifty = nifty.dropna()
+nifty.head()
+nifty = nifty.dropna()
+nifty.to_csv("features.csv")
+nifty.head()
+
+
+
+param_grid = {  'n_estimators': [2000, 5000, 6000], 'min_samples_split': [50, 100, 150],  'max_depth': [None, 10, 20]}
+grid_search = GridSearchCV(RandomForestClassifier(random_state=1), param_grid, cv=5, scoring='precision')
+grid_search.fit(nifty[new_predictors], nifty["Target"])
+
+best_model = grid_search.best_estimator_
+print("Best Parameters:", grid_search.best_params_)
+
+
+
+def predict(train, test, predictors, model):
+    model.fit(train[predictors], train["Target"])
+    preds = model.predict_proba(test[predictors])[:, 1]
+    preds = (preds >= 0.55).astype(int)
+    preds = pd.Series(preds, index=test.index, name="Predictions")
+    combined = pd.concat([test["Target"], preds], axis=1)
+    return combined
+
+def backtest(data, model, predictors, start=2500, step=250):
+    all_predictions = []
+    for i in range(start, data.shape[0], step):
+        train = data.iloc[0:i].copy()
+        test = data.iloc[i:(i+step)].copy()
+        predictions = predict(train, test, predictors, model)
+        all_predictions.append(predictions)
+    return pd.concat(all_predictions)
+
+
+predictions = backtest(nifty, best_model, new_predictors)
+print("Backtest Predictions Count:\n", predictions["Predictions"].value_counts())
+print("Backtest Precision Score:", precision_score(predictions["Target"], predictions["Predictions"]))
+
+
+precision_over_time = []
+time_indices = []
+
+step = 250
+for i in range(0, predictions.shape[0], step):
+    interval_data = predictions.iloc[i:i + step]
+    precision = precision_score(interval_data["Target"], interval_data["Predictions"])
+    precision_over_time.append(precision)
+    time_indices.append(interval_data.index[-1])
+
+plt.figure(figsize=(12, 6))
+plt.plot(time_indices, precision_over_time, marker='o', linestyle='-', color='b')
+plt.xlabel('Date')
+plt.ylabel('Precision Score')
+plt.title('Backtesting Precision Over Time')
+plt.xticks(rotation=0)
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+from sklearn.metrics import confusion_matrix
+
+conf_matrix = confusion_matrix(predictions["Target"], predictions["Predictions"])
+
+
+true_positives = conf_matrix[1, 1]
+false_positives = conf_matrix[0, 1]
+
+precision_for_positive_trend = true_positives / (true_positives + false_positives)
+print("Precision for Positive Trend Predictions (1):", precision_for_positive_trend)
+
+
+conf_matrix = confusion_matrix(predictions["Target"], predictions["Predictions"])
+
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', cbar=False,
+            xticklabels=["Predicted Negative", "Predicted Positive"],
+            yticklabels=["Actual Negative", "Actual Positive"])
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+plt.title("Confusion Matrix for Nifty 50 Prediction Model")
+plt.show()
+
+
+true_positives = conf_matrix[1, 1]
+false_positives = conf_matrix[0, 1]
+precision_for_positive_trend = true_positives / (true_positives + false_positives)
+
+print("Precision for Positive Trend Predictions (1):", precision_for_positive_trend)
+
+
+last_date = nifty.index[-1]
+future_dates = [last_date + pd.Timedelta(days=i) for i in range(1, 6)]
+
+future_data = pd.DataFrame(index=future_dates, columns=nifty.columns)
+for column in ["Close", "Volume", "Open", "High", "Low"]:
+    future_data[column] = nifty[column].iloc[-1]
+
+for horizon in horizons:
+    ratio_column = f"Close_Ratio_{horizon}"
+    trend_column = f"Trend_{horizon}"
+    momentum_column = f"Momentum_{horizon}"
+
+    future_data[ratio_column] = nifty[ratio_column].iloc[-1]
+    future_data[trend_column] = nifty[trend_column].iloc[-1]
+    future_data[momentum_column] = nifty[momentum_column].iloc[-1]
+
+nifty_extended = pd.concat([nifty, future_data.drop(columns=["Target"])])
+nifty_extended_train = nifty_extended[nifty_extended["Target"].isin([0, 1])].dropna(subset=["Target"])
+best_model.fit(nifty_extended_train[new_predictors], nifty_extended_train["Target"])
+future_preds = best_model.predict(future_data[new_predictors])
+
+future_data["Predictions"] = future_preds
+print( future_data[["Predictions"]])
+
+
+plt.figure(figsize=(10, 5))
+plt.plot(future_data.index, future_data["Predictions"], marker='o', linestyle='-', color='red', label="Predicted Trend")
+plt.xlabel("Date")
+plt.ylabel("Predicted Trend (1=Up, 0=Down)")
+plt.title("Nifty 50 Predictions for the Next 10 Days")
+plt.xticks(rotation=45)
+plt.yticks([0, 1])
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+predictions.to_csv("predictions.csv")
+
+predictions=predictions.loc["2024-01-01":]
+predictions.plot();
